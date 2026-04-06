@@ -1,0 +1,91 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: Arial, sans-serif;
+}
+
+body {
+    padding: 40px;
+    background-color: #fff;
+}
+
+.container {
+    display: flex;
+    gap: 40px;
+    max-width: 1000px;
+    margin: 0 auto;
+}
+
+/* Левая колонка */
+.left-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Блоки с параметрами методов */
+.form-group-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mt-20 {
+    margin-top: 20px;
+}
+
+input[type="text"], textarea {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    outline: none;
+    font-size: 14px;
+}
+
+button {
+    width: 100%;
+    padding: 10px;
+    background-color: #f8f9fa;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.2s;
+}
+
+button:hover {
+    background-color: #e2e6ea;
+}
+
+/* Правая колонка */
+.right-panel {
+    flex: 1.5;
+    display: flex;
+    flex-direction: column;
+}
+
+.right-panel label {
+    margin-bottom: 10px;
+    font-size: 16px;
+    font-weight: bold;
+}
+
+#responseArea {
+    flex-grow: 1;
+    height: 100%;
+    min-height: 500px;
+    resize: none;
+    background-color: #fafafa;
+    font-family: monospace; /* Моноширинный шрифт для JSON */
+    font-size: 14px;
+    color: #333;
+}
