@@ -191,27 +191,36 @@ while current_t < END:
     # Фиксируем spread на момент фактического исполнения входа (а не на confirm_idx)
     entry_exec_idx = np.searchsorted(times, entry_exec_ms)
     if entry_exec_idx < len(times):
+        spread_entry_ms = int(times[entry_exec_idx])
         spread_entry = float(spreads[entry_exec_idx])
     else:
         spread_after_entry = client.execute(f'''
-            SELECT spread
+            SELECT toUInt64(toUnixTimestamp64Milli(event_time)) as t, spread
             FROM ticks.spreads
             WHERE event_time >= toDateTime64({entry_exec_ms / 1000}, 3)
             ORDER BY event_time
             LIMIT 1
         ''')
-        spread_entry = float(spread_after_entry[0][0]) if spread_after_entry else float(spreads[-1])
+        if spread_after_entry:
+            spread_entry_ms = int(spread_after_entry[0][0])
+            spread_entry = float(spread_after_entry[0][1])
+        else:
+            spread_entry_ms = int(times[-1])
+            spread_entry = float(spreads[-1])
 
     # ─────────────────────────────────────────
     # ВЫХОД (сначала ищем сигнал)
     # ─────────────────────────────────────────
     exit_signal_ms = None
+    exit_signal_spread = None
 
     # Важно: сигнал выхода ищем только ПОСЛЕ фактического входа.
     exit_candidates = np.where((times >= entry_exec_ms) & (spreads <= EXIT_SPREAD))[0]
 
     if len(exit_candidates) > 0:
-        exit_signal_ms = int(times[exit_candidates[0]])
+        exit_idx = int(exit_candidates[0])
+        exit_signal_ms = int(times[exit_idx])
+        exit_signal_spread = float(spreads[exit_idx])
     else:
         search_t = max(int(times[-1]) + 1, entry_exec_ms + 1)
         found = False
@@ -237,7 +246,9 @@ while current_t < END:
             idxs = np.where((t2 >= entry_exec_ms) & (s2 <= EXIT_SPREAD))[0]
 
             if len(idxs) > 0:
-                exit_signal_ms = int(t2[idxs[0]])
+                exit_idx = int(idxs[0])
+                exit_signal_ms = int(t2[exit_idx])
+                exit_signal_spread = float(s2[exit_idx])
                 found = True
                 break
 
@@ -245,13 +256,26 @@ while current_t < END:
 
         if not found:
             exit_signal_ms = entry_exec_ms + TIMEOUT_MS
+            spread_at_timeout = client.execute(f'''
+                SELECT toUInt64(toUnixTimestamp64Milli(event_time)) as t, spread
+                FROM ticks.spreads
+                WHERE event_time <= toDateTime64({exit_signal_ms / 1000}, 3)
+                ORDER BY event_time DESC
+                LIMIT 1
+            ''')
+            exit_signal_spread = float(spread_at_timeout[0][1]) if spread_at_timeout else None
 
-    # Цена выхода по требованию: вход + задержка выхода.
-    exit_exec_ms = entry_exec_ms + EXIT_DELAY_MS
+    # Выход: сигнал по спреду + задержка исполнения
+    exit_exec_ms = exit_signal_ms + EXIT_DELAY_MS
 
     # ─────────────────────────────────────────
     # ЦЕНЫ
     # ─────────────────────────────────────────
+    exit_signal_snapshot = coinex_snapshot_at(exit_signal_ms, side='prev')
+    if not exit_signal_snapshot:
+        current_t = exit_exec_ms + 1
+        continue
+
     # На выходе также используем ближайшую предыдущую цену CoinEx.
     exit_snapshot = coinex_snapshot_at(exit_exec_ms, side='prev')
 
@@ -262,6 +286,23 @@ while current_t < END:
     exit_bid = exit_snapshot['bid']
     exit_ask = exit_snapshot['ask']
     exit_px_ms = exit_snapshot['updated_at']
+    exit_signal_bid = exit_signal_snapshot['bid']
+    exit_signal_ask = exit_signal_snapshot['ask']
+    exit_signal_px_ms = exit_signal_snapshot['updated_at']
+
+    spread_exit_raw = client.execute(f'''
+        SELECT toUInt64(toUnixTimestamp64Milli(event_time)) as t, spread
+        FROM ticks.spreads
+        WHERE event_time >= toDateTime64({exit_exec_ms / 1000}, 3)
+        ORDER BY event_time
+        LIMIT 1
+    ''')
+    if spread_exit_raw:
+        spread_exit_ms = int(spread_exit_raw[0][0])
+        spread_exit = float(spread_exit_raw[0][1])
+    else:
+        spread_exit_ms = exit_signal_ms
+        spread_exit = float(exit_signal_spread) if exit_signal_spread is not None else float('nan')
 
     profit_pct = (exit_bid - entry_ask) / entry_ask * 100
     hold_min = (exit_exec_ms - entry_exec_ms) / 60000
@@ -271,15 +312,24 @@ while current_t < END:
         'entry_ms': entry_exec_ms,
         'exit_ms': exit_exec_ms,
         'signal_spread': signal_spread,
+        'exit_signal_spread': exit_signal_spread,
+        'exit_spread': spread_exit,
         'profit_pct': profit_pct,
         'hold_min': hold_min,
         'spread_entry': spread_entry,
+        'signal_spread_ts': entry_signal_ms,
+        'entry_spread_ts': spread_entry_ms,
+        'exit_signal_spread_ts': exit_signal_ms,
+        'exit_spread_ts': spread_exit_ms,
         'signal_coinex_ts': signal_snapshot['updated_at'],
         'signal_coinex_bid': signal_snapshot['bid'],
         'signal_coinex_ask': signal_snapshot['ask'],
         'entry_coinex_ts': entry_px_ms,
         'entry_coinex_bid': entry_bid,
         'entry_coinex_ask': entry_ask,
+        'exit_signal_coinex_ts': exit_signal_px_ms,
+        'exit_signal_coinex_bid': exit_signal_bid,
+        'exit_signal_coinex_ask': exit_signal_ask,
         'exit_coinex_ts': exit_px_ms,
         'exit_coinex_bid': exit_bid,
         'exit_coinex_ask': exit_ask,
@@ -287,12 +337,17 @@ while current_t < END:
 
     print(
         f"signal={ms_to_str(entry_signal_ms)} spread={signal_spread:.2f} "
-        f"coinex(sig) ts={ms_to_str(signal_snapshot['updated_at'])} "
+        f"spread_ts={ms_to_str(entry_signal_ms)} coinex_ts={ms_to_str(signal_snapshot['updated_at'])} "
         f"bid={signal_snapshot['bid']:.2f} ask={signal_snapshot['ask']:.2f} | "
         f"entry={ms_to_str(entry_exec_ms)} spread={spread_entry:.2f} "
-        f"coinex(entry) ts={ms_to_str(entry_px_ms)} bid={entry_bid:.2f} ask={entry_ask:.2f} | "
-        f"exit={ms_to_str(exit_exec_ms)} "
-        f"coinex(exit) ts={ms_to_str(exit_px_ms)} bid={exit_bid:.2f} ask={exit_ask:.2f} | "
+        f"spread_ts={ms_to_str(spread_entry_ms)} coinex_ts={ms_to_str(entry_px_ms)} "
+        f"bid={entry_bid:.2f} ask={entry_ask:.2f} | "
+        f"exit_signal={ms_to_str(exit_signal_ms)} spread={exit_signal_spread if exit_signal_spread is not None else float('nan'):.2f} "
+        f"spread_ts={ms_to_str(exit_signal_ms)} coinex_ts={ms_to_str(exit_signal_px_ms)} "
+        f"bid={exit_signal_bid:.2f} ask={exit_signal_ask:.2f} | "
+        f"exit={ms_to_str(exit_exec_ms)} spread={spread_exit:.2f} "
+        f"spread_ts={ms_to_str(spread_exit_ms)} coinex_ts={ms_to_str(exit_px_ms)} "
+        f"bid={exit_bid:.2f} ask={exit_ask:.2f} | "
         f"profit={profit_pct:.4f}% hold={hold_min:.2f}m"
     )
 
