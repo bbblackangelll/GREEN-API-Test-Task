@@ -91,9 +91,6 @@ while current_t < END:
     sig_idxs = np.where(sig_mask)[0]
 
     entry_idx = None
-    entry_exec_ms = None
-    entry_ask = None
-    entry_signal_ms = None
 
     for idx in sig_idxs:
         confirm_t = times[idx] + CONFIRM_MS
@@ -106,13 +103,13 @@ while current_t < END:
             continue
 
         # 👉 теперь учитываем задержку входа
-        candidate_entry_exec_ms = confirm_t + ENTRY_DELAY_MS
+        entry_exec_ms = confirm_t + ENTRY_DELAY_MS
 
         # CoinEx цена
         prices_entry = client.execute(f'''
             SELECT ask_price
             FROM ticks.coinex_btcusdt
-            WHERE updated_at >= {candidate_entry_exec_ms}
+            WHERE updated_at >= {entry_exec_ms}
             ORDER BY updated_at
             LIMIT 1
         ''')
@@ -120,69 +117,54 @@ while current_t < END:
         if not prices_entry:
             continue
 
-        candidate_entry_ask = float(prices_entry[0][0])
-        if candidate_entry_ask == 0:
+        entry_ask = float(prices_entry[0][0])
+        if entry_ask == 0:
             continue
 
         # фильтр движения
         coinex_prev_raw = client.execute(f'''
             SELECT ask_price
             FROM ticks.coinex_btcusdt
-            WHERE updated_at <= {candidate_entry_exec_ms - 2000}
+            WHERE updated_at <= {entry_exec_ms - 2000}
             ORDER BY updated_at DESC
             LIMIT 1
         ''')
 
-        coinex_prev = float(coinex_prev_raw[0][0]) if coinex_prev_raw else candidate_entry_ask
-        change_pct = abs(candidate_entry_ask - coinex_prev) / coinex_prev * 100 if coinex_prev > 0 else 0
+        coinex_prev = float(coinex_prev_raw[0][0]) if coinex_prev_raw else entry_ask
+        change_pct = abs(entry_ask - coinex_prev) / coinex_prev * 100 if coinex_prev > 0 else 0
 
         if change_pct > COINEX_MAX_MOVE_PCT:
             continue
 
         # тренд
-        trend = binance_trend_up(candidate_entry_exec_ms)
+        trend = binance_trend_up(entry_exec_ms)
         if trend is None or not trend:
             continue
 
         entry_idx = confirm_idx
-        entry_exec_ms = int(candidate_entry_exec_ms)
-        entry_ask = candidate_entry_ask
-        entry_signal_ms = int(times[idx])
         break
 
     if entry_idx is None:
         current_t = t1
         continue
 
-    # Фиксируем spread на момент фактического исполнения входа (а не на confirm_idx)
-    entry_exec_idx = np.searchsorted(times, entry_exec_ms)
-    if entry_exec_idx < len(times):
-        spread_entry = float(spreads[entry_exec_idx])
-    else:
-        spread_after_entry = client.execute(f'''
-            SELECT spread
-            FROM ticks.spreads
-            WHERE event_time >= toDateTime64({entry_exec_ms / 1000}, 3)
-            ORDER BY event_time
-            LIMIT 1
-        ''')
-        spread_entry = float(spread_after_entry[0][0]) if spread_after_entry else float(spreads[-1])
+    entry_ms = int(times[entry_idx])
+    spread_entry = float(spreads[entry_idx])
 
     # ─────────────────────────────────────────
     # ВЫХОД (сначала ищем сигнал)
     # ─────────────────────────────────────────
     exit_signal_ms = None
 
-    # Важно: сигнал выхода ищем только ПОСЛЕ фактического входа.
-    exit_candidates = np.where((times >= entry_exec_ms) & (spreads <= EXIT_SPREAD))[0]
+    exit_candidates = np.where(spreads[entry_idx:] <= EXIT_SPREAD)[0]
 
     if len(exit_candidates) > 0:
-        exit_signal_ms = int(times[exit_candidates[0]])
+        exit_signal_ms = int(times[entry_idx + exit_candidates[0]])
     else:
-        search_t = max(int(times[-1]) + 1, entry_exec_ms + 1)
+        search_t = times[-1] + 1
         found = False
 
-        while search_t < entry_exec_ms + TIMEOUT_MS:
+        while search_t < entry_ms + TIMEOUT_MS:
 
             next_batch = client.execute(f'''
                 SELECT toUInt64(toUnixTimestamp64Milli(event_time)) as t, spread
@@ -200,7 +182,7 @@ while current_t < END:
             t2 = df2['t'].to_numpy()
             s2 = df2['spread'].to_numpy().astype(np.float32)
 
-            idxs = np.where((t2 >= entry_exec_ms) & (s2 <= EXIT_SPREAD))[0]
+            idxs = np.where(s2 <= EXIT_SPREAD)[0]
 
             if len(idxs) > 0:
                 exit_signal_ms = int(t2[idxs[0]])
@@ -210,18 +192,22 @@ while current_t < END:
             search_t = t2[-1] + 1
 
         if not found:
-            exit_signal_ms = entry_exec_ms + TIMEOUT_MS
+            exit_signal_ms = entry_ms + TIMEOUT_MS
 
     # 👉 теперь учитываем задержку выхода
     exit_exec_ms = exit_signal_ms + EXIT_DELAY_MS
 
-    # Защита от нереалистичного удержания: выход не может исполниться раньше входа.
-    if exit_exec_ms <= entry_exec_ms:
-        exit_exec_ms = entry_exec_ms + EXIT_DELAY_MS
-
     # ─────────────────────────────────────────
     # ЦЕНЫ
     # ─────────────────────────────────────────
+    entry_price = client.execute(f'''
+        SELECT ask_price
+        FROM ticks.coinex_btcusdt
+        WHERE updated_at >= {entry_exec_ms}
+        ORDER BY updated_at
+        LIMIT 1
+    ''')
+
     exit_price = client.execute(f'''
         SELECT bid_price
         FROM ticks.coinex_btcusdt
@@ -230,10 +216,11 @@ while current_t < END:
         LIMIT 1
     ''')
 
-    if not exit_price:
+    if not entry_price or not exit_price:
         current_t = exit_exec_ms + 1
         continue
 
+    entry_ask = float(entry_price[0][0])
     exit_bid = float(exit_price[0][0])
 
     profit_pct = (exit_bid - entry_ask) / entry_ask * 100
@@ -249,8 +236,7 @@ while current_t < END:
 
     print(
         f"[{ms_to_str(entry_exec_ms)} → {ms_to_str(exit_exec_ms)}] "
-        f"signal={ms_to_str(entry_signal_ms)} spread={spread_entry:.2f} "
-        f"profit={profit_pct:.4f}% hold={hold_min:.2f}m"
+        f"spread={spread_entry:.2f} profit={profit_pct:.4f}% hold={hold_min:.2f}m"
     )
 
     current_t = exit_exec_ms + 1
