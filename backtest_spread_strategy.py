@@ -29,6 +29,26 @@ def ms_to_str(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
 
+def coinex_snapshot_at(ts_ms):
+    snap = client.execute(f'''
+        SELECT updated_at, bid_price, ask_price
+        FROM ticks.coinex_btcusdt
+        WHERE updated_at >= {int(ts_ms)}
+        ORDER BY updated_at
+        LIMIT 1
+    ''')
+
+    if not snap:
+        return None
+
+    updated_at, bid_price, ask_price = snap[0]
+    return {
+        'updated_at': int(updated_at),
+        'bid': float(bid_price),
+        'ask': float(ask_price),
+    }
+
+
 # ─────────────────────────────────────────────
 # Binance тренд (5 секунд)
 # ─────────────────────────────────────────────
@@ -91,6 +111,9 @@ while current_t < END:
     sig_idxs = np.where(sig_mask)[0]
 
     entry_idx = None
+    entry_exec_ms = None
+    entry_ask = None
+    entry_signal_ms = None
 
     for idx in sig_idxs:
         confirm_t = times[idx] + CONFIRM_MS
@@ -103,68 +126,84 @@ while current_t < END:
             continue
 
         # 👉 теперь учитываем задержку входа
-        entry_exec_ms = confirm_t + ENTRY_DELAY_MS
+        candidate_entry_exec_ms = confirm_t + ENTRY_DELAY_MS
 
-        # CoinEx цена
-        prices_entry = client.execute(f'''
-            SELECT ask_price
-            FROM ticks.coinex_btcusdt
-            WHERE updated_at >= {entry_exec_ms}
-            ORDER BY updated_at
-            LIMIT 1
-        ''')
-
-        if not prices_entry:
+        # CoinEx снапшот на входе (по времени исполнения)
+        entry_snapshot = coinex_snapshot_at(candidate_entry_exec_ms)
+        if not entry_snapshot:
             continue
 
-        entry_ask = float(prices_entry[0][0])
-        if entry_ask == 0:
+        candidate_entry_ask = entry_snapshot['ask']
+        if candidate_entry_ask == 0:
             continue
 
         # фильтр движения
         coinex_prev_raw = client.execute(f'''
             SELECT ask_price
             FROM ticks.coinex_btcusdt
-            WHERE updated_at <= {entry_exec_ms - 2000}
+            WHERE updated_at <= {candidate_entry_exec_ms - 2000}
             ORDER BY updated_at DESC
             LIMIT 1
         ''')
 
-        coinex_prev = float(coinex_prev_raw[0][0]) if coinex_prev_raw else entry_ask
-        change_pct = abs(entry_ask - coinex_prev) / coinex_prev * 100 if coinex_prev > 0 else 0
+        coinex_prev = float(coinex_prev_raw[0][0]) if coinex_prev_raw else candidate_entry_ask
+        change_pct = abs(candidate_entry_ask - coinex_prev) / coinex_prev * 100 if coinex_prev > 0 else 0
 
         if change_pct > COINEX_MAX_MOVE_PCT:
             continue
 
         # тренд
-        trend = binance_trend_up(entry_exec_ms)
+        trend = binance_trend_up(candidate_entry_exec_ms)
         if trend is None or not trend:
             continue
 
         entry_idx = confirm_idx
+        entry_exec_ms = int(candidate_entry_exec_ms)
+        entry_ask = candidate_entry_ask
+        entry_bid = entry_snapshot['bid']
+        entry_px_ms = entry_snapshot['updated_at']
+        entry_signal_ms = int(times[idx])
+        signal_spread = float(spreads[idx])
         break
 
     if entry_idx is None:
         current_t = t1
         continue
 
-    entry_ms = int(times[entry_idx])
-    spread_entry = float(spreads[entry_idx])
+    signal_snapshot = coinex_snapshot_at(entry_signal_ms)
+    if not signal_snapshot:
+        current_t = t1
+        continue
+
+    # Фиксируем spread на момент фактического исполнения входа (а не на confirm_idx)
+    entry_exec_idx = np.searchsorted(times, entry_exec_ms)
+    if entry_exec_idx < len(times):
+        spread_entry = float(spreads[entry_exec_idx])
+    else:
+        spread_after_entry = client.execute(f'''
+            SELECT spread
+            FROM ticks.spreads
+            WHERE event_time >= toDateTime64({entry_exec_ms / 1000}, 3)
+            ORDER BY event_time
+            LIMIT 1
+        ''')
+        spread_entry = float(spread_after_entry[0][0]) if spread_after_entry else float(spreads[-1])
 
     # ─────────────────────────────────────────
     # ВЫХОД (сначала ищем сигнал)
     # ─────────────────────────────────────────
     exit_signal_ms = None
 
-    exit_candidates = np.where(spreads[entry_idx:] <= EXIT_SPREAD)[0]
+    # Важно: сигнал выхода ищем только ПОСЛЕ фактического входа.
+    exit_candidates = np.where((times >= entry_exec_ms) & (spreads <= EXIT_SPREAD))[0]
 
     if len(exit_candidates) > 0:
-        exit_signal_ms = int(times[entry_idx + exit_candidates[0]])
+        exit_signal_ms = int(times[exit_candidates[0]])
     else:
-        search_t = times[-1] + 1
+        search_t = max(int(times[-1]) + 1, entry_exec_ms + 1)
         found = False
 
-        while search_t < entry_ms + TIMEOUT_MS:
+        while search_t < entry_exec_ms + TIMEOUT_MS:
 
             next_batch = client.execute(f'''
                 SELECT toUInt64(toUnixTimestamp64Milli(event_time)) as t, spread
@@ -182,7 +221,7 @@ while current_t < END:
             t2 = df2['t'].to_numpy()
             s2 = df2['spread'].to_numpy().astype(np.float32)
 
-            idxs = np.where(s2 <= EXIT_SPREAD)[0]
+            idxs = np.where((t2 >= entry_exec_ms) & (s2 <= EXIT_SPREAD))[0]
 
             if len(idxs) > 0:
                 exit_signal_ms = int(t2[idxs[0]])
@@ -192,51 +231,59 @@ while current_t < END:
             search_t = t2[-1] + 1
 
         if not found:
-            exit_signal_ms = entry_ms + TIMEOUT_MS
+            exit_signal_ms = entry_exec_ms + TIMEOUT_MS
 
     # 👉 теперь учитываем задержку выхода
     exit_exec_ms = exit_signal_ms + EXIT_DELAY_MS
 
+    # Защита от нереалистичного удержания: выход не может исполниться раньше входа.
+    if exit_exec_ms <= entry_exec_ms:
+        exit_exec_ms = entry_exec_ms + EXIT_DELAY_MS
+
     # ─────────────────────────────────────────
     # ЦЕНЫ
     # ─────────────────────────────────────────
-    entry_price = client.execute(f'''
-        SELECT ask_price
-        FROM ticks.coinex_btcusdt
-        WHERE updated_at >= {entry_exec_ms}
-        ORDER BY updated_at
-        LIMIT 1
-    ''')
+    exit_snapshot = coinex_snapshot_at(exit_exec_ms)
 
-    exit_price = client.execute(f'''
-        SELECT bid_price
-        FROM ticks.coinex_btcusdt
-        WHERE updated_at >= {exit_exec_ms}
-        ORDER BY updated_at
-        LIMIT 1
-    ''')
-
-    if not entry_price or not exit_price:
+    if not exit_snapshot:
         current_t = exit_exec_ms + 1
         continue
 
-    entry_ask = float(entry_price[0][0])
-    exit_bid = float(exit_price[0][0])
+    exit_bid = exit_snapshot['bid']
+    exit_ask = exit_snapshot['ask']
+    exit_px_ms = exit_snapshot['updated_at']
 
     profit_pct = (exit_bid - entry_ask) / entry_ask * 100
     hold_min = (exit_exec_ms - entry_exec_ms) / 60000
 
     all_trades.append({
+        'signal_ms': entry_signal_ms,
         'entry_ms': entry_exec_ms,
         'exit_ms': exit_exec_ms,
+        'signal_spread': signal_spread,
         'profit_pct': profit_pct,
         'hold_min': hold_min,
-        'spread_entry': spread_entry
+        'spread_entry': spread_entry,
+        'signal_coinex_ts': signal_snapshot['updated_at'],
+        'signal_coinex_bid': signal_snapshot['bid'],
+        'signal_coinex_ask': signal_snapshot['ask'],
+        'entry_coinex_ts': entry_px_ms,
+        'entry_coinex_bid': entry_bid,
+        'entry_coinex_ask': entry_ask,
+        'exit_coinex_ts': exit_px_ms,
+        'exit_coinex_bid': exit_bid,
+        'exit_coinex_ask': exit_ask,
     })
 
     print(
-        f"[{ms_to_str(entry_exec_ms)} → {ms_to_str(exit_exec_ms)}] "
-        f"spread={spread_entry:.2f} profit={profit_pct:.4f}% hold={hold_min:.2f}m"
+        f"signal={ms_to_str(entry_signal_ms)} spread={signal_spread:.2f} "
+        f"coinex(sig) ts={ms_to_str(signal_snapshot['updated_at'])} "
+        f"bid={signal_snapshot['bid']:.2f} ask={signal_snapshot['ask']:.2f} | "
+        f"entry={ms_to_str(entry_exec_ms)} spread={spread_entry:.2f} "
+        f"coinex(entry) ts={ms_to_str(entry_px_ms)} bid={entry_bid:.2f} ask={entry_ask:.2f} | "
+        f"exit={ms_to_str(exit_exec_ms)} "
+        f"coinex(exit) ts={ms_to_str(exit_px_ms)} bid={exit_bid:.2f} ask={exit_ask:.2f} | "
+        f"profit={profit_pct:.4f}% hold={hold_min:.2f}m"
     )
 
     current_t = exit_exec_ms + 1
