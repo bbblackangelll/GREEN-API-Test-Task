@@ -13,6 +13,10 @@ EXIT_SPREAD = -15
 TIMEOUT_MS = 60 * 60 * 1000
 ENTRY_BATCH_MS = 60 * 60 * 1000
 COINEX_MAX_MOVE_PCT = 0.01
+CONFIRM_MIN_SPREAD = 0
+COINEX_LOOKBACK_MS = 2000
+BINANCE_TREND_WINDOW_MS = 5000
+BINANCE_SYMBOL = 'BTCUSDT'
 
 # ─────────────────────────────────────────────
 START, END = client.execute('''
@@ -71,13 +75,13 @@ def binance_trend_up(entry_ms):
         SELECT
             avgIf((bid_price + ask_price) / 2, event_time >= toDateTime64({entry_ms / 1000}, 3)) AS price_now,
             avgIf((bid_price + ask_price) / 2,
-                event_time >= toDateTime64({(entry_ms - 5000) / 1000}, 3)
+                event_time >= toDateTime64({(entry_ms - BINANCE_TREND_WINDOW_MS) / 1000}, 3)
                 AND event_time < toDateTime64({entry_ms / 1000}, 3)
             ) AS price_5s_ago
         FROM ticks.binance_bbo
-        WHERE event_time >= toDateTime64({(entry_ms - 5000) / 1000}, 3)
+        WHERE event_time >= toDateTime64({(entry_ms - BINANCE_TREND_WINDOW_MS) / 1000}, 3)
           AND event_time <= toDateTime64({entry_ms / 1000}, 3)
-          AND symbol = 'BTCUSDT'
+          AND symbol = '{BINANCE_SYMBOL}'
     ''')
 
     if not result or result[0][0] is None or result[0][1] is None:
@@ -117,11 +121,7 @@ while current_t < END:
     # ─────────────────────────────────────────
     # ВХОД
     # ─────────────────────────────────────────
-    prev = np.empty_like(spreads)
-    prev[1:] = spreads[:-1]
-    prev[0] = spreads[0]
-
-    sig_mask = (spreads >= ENTRY_THRESHOLD) & (prev < ENTRY_THRESHOLD)
+    sig_mask = spreads > ENTRY_THRESHOLD
     sig_idxs = np.where(sig_mask)[0]
 
     entry_idx = None
@@ -136,7 +136,7 @@ while current_t < END:
         if confirm_idx >= len(spreads):
             continue
 
-        if spreads[confirm_idx] < 0:
+        if spreads[confirm_idx] < CONFIRM_MIN_SPREAD:
             continue
 
         # 👉 теперь учитываем задержку входа
@@ -148,14 +148,12 @@ while current_t < END:
             continue
 
         candidate_entry_ask = entry_snapshot['ask']
-        if candidate_entry_ask == 0:
-            continue
 
         # фильтр движения
         coinex_prev_raw = client.execute(f'''
             SELECT ask_price
             FROM ticks.coinex_btcusdt
-            WHERE updated_at <= {candidate_entry_exec_ms - 2000}
+            WHERE updated_at <= {candidate_entry_exec_ms - COINEX_LOOKBACK_MS}
             ORDER BY updated_at DESC
             LIMIT 1
         ''')
@@ -248,12 +246,8 @@ while current_t < END:
         if not found:
             exit_signal_ms = entry_exec_ms + TIMEOUT_MS
 
-    # 👉 теперь учитываем задержку выхода
-    exit_exec_ms = exit_signal_ms + EXIT_DELAY_MS
-
-    # Защита от нереалистичного удержания: выход не может исполниться раньше входа.
-    if exit_exec_ms <= entry_exec_ms:
-        exit_exec_ms = entry_exec_ms + EXIT_DELAY_MS
+    # Цена выхода по требованию: вход + задержка выхода.
+    exit_exec_ms = entry_exec_ms + EXIT_DELAY_MS
 
     # ─────────────────────────────────────────
     # ЦЕНЫ
