@@ -29,12 +29,21 @@ def ms_to_str(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
 
-def coinex_snapshot_at(ts_ms):
+def coinex_snapshot_at(ts_ms, side='prev', max_gap_ms=None):
+    ts_ms = int(ts_ms)
+
+    if side == 'prev':
+        where_cond = f"updated_at <= {ts_ms}"
+        order = "ORDER BY updated_at DESC"
+    else:
+        where_cond = f"updated_at >= {ts_ms}"
+        order = "ORDER BY updated_at ASC"
+
     snap = client.execute(f'''
         SELECT updated_at, bid_price, ask_price
         FROM ticks.coinex_btcusdt
-        WHERE updated_at >= {int(ts_ms)}
-        ORDER BY updated_at
+        WHERE {where_cond}
+        {order}
         LIMIT 1
     ''')
 
@@ -42,8 +51,13 @@ def coinex_snapshot_at(ts_ms):
         return None
 
     updated_at, bid_price, ask_price = snap[0]
+    updated_at = int(updated_at)
+
+    if max_gap_ms is not None and abs(updated_at - ts_ms) > int(max_gap_ms):
+        return None
+
     return {
-        'updated_at': int(updated_at),
+        'updated_at': updated_at,
         'bid': float(bid_price),
         'ask': float(ask_price),
     }
@@ -129,7 +143,7 @@ while current_t < END:
         candidate_entry_exec_ms = confirm_t + ENTRY_DELAY_MS
 
         # CoinEx снапшот на входе (по времени исполнения)
-        entry_snapshot = coinex_snapshot_at(candidate_entry_exec_ms)
+        entry_snapshot = coinex_snapshot_at(candidate_entry_exec_ms, side='prev')
         if not entry_snapshot:
             continue
 
@@ -170,7 +184,8 @@ while current_t < END:
         current_t = t1
         continue
 
-    signal_snapshot = coinex_snapshot_at(entry_signal_ms)
+    # Для сигнала берем ближайшую предыдущую цену CoinEx.
+    signal_snapshot = coinex_snapshot_at(entry_signal_ms, side='prev')
     if not signal_snapshot:
         current_t = t1
         continue
@@ -243,7 +258,8 @@ while current_t < END:
     # ─────────────────────────────────────────
     # ЦЕНЫ
     # ─────────────────────────────────────────
-    exit_snapshot = coinex_snapshot_at(exit_exec_ms)
+    # На выходе также используем ближайшую предыдущую цену CoinEx.
+    exit_snapshot = coinex_snapshot_at(exit_exec_ms, side='prev')
 
     if not exit_snapshot:
         current_t = exit_exec_ms + 1
