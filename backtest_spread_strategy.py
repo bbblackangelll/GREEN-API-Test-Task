@@ -367,11 +367,23 @@ if all_trades:
 
     cum = df['profit_pct'].cum_sum().to_numpy()
     max_dd = float((np.maximum.accumulate(cum) - cum).max())
+    profits = df['profit_pct'].to_numpy()
+    wins = profits[profits > 0]
+    losses = profits[profits < 0]
+
+    avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0
+    max_profit = float(profits.max()) if len(profits) > 0 else 0.0
+    max_loss = float(profits.min()) if len(profits) > 0 else 0.0
 
     print(f"\\nСделок: {len(df)}")
     print(f"Winrate: {(df['profit_pct'] > 0).mean():.2%}")
     print(f"Total: {df['profit_pct'].sum():.4f}%")
     print(f"Avg: {df['profit_pct'].mean():.4f}%")
+    print(f"Avg Win: {avg_win:.4f}%")
+    print(f"Avg Loss: {avg_loss:.4f}%")
+    print(f"Max Profit: {max_profit:.4f}%")
+    print(f"Max Loss: {max_loss:.4f}%")
     print(f"Max DD: {max_dd:.4f}%")
     print(f"Avg hold: {df['hold_min'].mean():.2f} мин")
 else:
@@ -402,6 +414,10 @@ if all_trades:
         f"Winrate: {(df['profit_pct'] > 0).mean():.2%}",
         f"Total: {df['profit_pct'].sum():.4f}%",
         f"Avg: {df['profit_pct'].mean():.4f}%",
+        f"Avg Win: {avg_win:.4f}%",
+        f"Avg Loss: {avg_loss:.4f}%",
+        f"Max Profit: {max_profit:.4f}%",
+        f"Max Loss: {max_loss:.4f}%",
         f"Max DD: {max_dd:.4f}%",
         f"Avg hold: {df['hold_min'].mean():.2f} мин",
     ]
@@ -412,8 +428,20 @@ else:
         "Сделок нет",
     ]
 
-result_text = "\n".join(summary_lines + [""] + config_lines) + "\n"
-with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
+run_ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+result_text = "\n".join(
+    [
+        f"RUN_AT_UTC: {run_ts}",
+        f"RANGE: {ms_to_str(START)} → {ms_to_str(END)}",
+        *summary_lines,
+        "",
+        *config_lines,
+        "-" * 80,
+        "",
+    ]
+)
+
+with open(SUMMARY_FILE, 'a', encoding='utf-8') as f:
     f.write(result_text)
 
-print(f"\nИтоговый результат сохранен в {SUMMARY_FILE}")
+print(f"\nИтоговый результат ДОБАВЛЕН в {SUMMARY_FILE}")
