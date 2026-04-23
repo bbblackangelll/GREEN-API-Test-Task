@@ -17,6 +17,7 @@ CONFIRM_MIN_SPREAD = 0
 COINEX_LOOKBACK_MS = 2000
 BINANCE_TREND_WINDOW_MS = 5000
 BINANCE_SYMBOL = 'BTCUSDT'
+SUMMARY_FILE = 'backtest_summary.txt'
 
 # ─────────────────────────────────────────────
 START, END = client.execute('''
@@ -121,7 +122,12 @@ while current_t < END:
     # ─────────────────────────────────────────
     # ВХОД
     # ─────────────────────────────────────────
-    sig_mask = spreads > ENTRY_THRESHOLD
+    prev = np.empty_like(spreads)
+    prev[1:] = spreads[:-1]
+    prev[0] = spreads[0]
+
+    # Сигнал только на пересечении порога снизу вверх.
+    sig_mask = (spreads > ENTRY_THRESHOLD) & (prev <= ENTRY_THRESHOLD)
     sig_idxs = np.where(sig_mask)[0]
 
     entry_idx = None
@@ -370,3 +376,44 @@ if all_trades:
     print(f"Avg hold: {df['hold_min'].mean():.2f} мин")
 else:
     print("Сделок нет")
+
+config_lines = [
+    "CONFIG:",
+    f"ENTRY_THRESHOLD={ENTRY_THRESHOLD}",
+    f"CONFIRM_MS={CONFIRM_MS}",
+    f"ENTRY_DELAY_MS={ENTRY_DELAY_MS}",
+    f"EXIT_DELAY_MS={EXIT_DELAY_MS}",
+    f"EXIT_SPREAD={EXIT_SPREAD}",
+    f"TIMEOUT_MS={TIMEOUT_MS}",
+    f"ENTRY_BATCH_MS={ENTRY_BATCH_MS}",
+    f"COINEX_MAX_MOVE_PCT={COINEX_MAX_MOVE_PCT}",
+    f"CONFIRM_MIN_SPREAD={CONFIRM_MIN_SPREAD}",
+    f"COINEX_LOOKBACK_MS={COINEX_LOOKBACK_MS}",
+    f"BINANCE_TREND_WINDOW_MS={BINANCE_TREND_WINDOW_MS}",
+    f"BINANCE_SYMBOL={BINANCE_SYMBOL}",
+]
+
+print("\n" + "\n".join(config_lines))
+
+if all_trades:
+    summary_lines = [
+        f"Период: {ms_to_str(START)} → {ms_to_str(END)}",
+        f"Сделок: {len(df)}",
+        f"Winrate: {(df['profit_pct'] > 0).mean():.2%}",
+        f"Total: {df['profit_pct'].sum():.4f}%",
+        f"Avg: {df['profit_pct'].mean():.4f}%",
+        f"Max DD: {max_dd:.4f}%",
+        f"Avg hold: {df['hold_min'].mean():.2f} мин",
+    ]
+else:
+    summary_lines = [
+        f"Период: {ms_to_str(START)} → {ms_to_str(END)}",
+        "Сделок: 0",
+        "Сделок нет",
+    ]
+
+result_text = "\n".join(summary_lines + [""] + config_lines) + "\n"
+with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
+    f.write(result_text)
+
+print(f"\nИтоговый результат сохранен в {SUMMARY_FILE}")
